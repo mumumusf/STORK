@@ -90,6 +90,48 @@ async function getUserInput() {
   return accounts;
 }
 
+// 从文本文件加载账号信息
+async function loadAccountsFromTextFile() {
+  try {
+    const configPath = path.join(__dirname, 'accounts.txt');
+    if (!fs.existsSync(configPath)) {
+      log('未找到配置文件 accounts.txt', 'WARN');
+      return null;
+    }
+    const fileContent = await fs.promises.readFile(configPath, 'utf8');
+    const accounts = [];
+    
+    // 按行分割并处理每一行
+    const lines = fileContent.split('\n');
+    for (const line of lines) {
+      // 跳过空行和注释
+      if (!line.trim() || line.trim().startsWith('#')) {
+        continue;
+      }
+      
+      // 使用----分割字段
+      const parts = line.trim().split('----');
+      if (parts.length >= 2) {
+        accounts.push({
+          username: parts[0].trim(),
+          password: parts[1].trim(),
+          proxy: parts[2] ? parts[2].trim() : ''
+        });
+      }
+    }
+    
+    if (accounts.length === 0) {
+      log('配置文件中没有有效的账号信息', 'WARN');
+      return null;
+    }
+    
+    return accounts;
+  } catch (error) {
+    log(`读取配置文件出错: ${error.message}`, 'ERROR');
+    return null;
+  }
+}
+
 // 从 config.json 加载配置
 async function loadConfig() {
   try {
@@ -482,22 +524,12 @@ if (!isMainThread) {
     try {
       log(`--------- 开始验证进程 (${accountConfig.cognito.username}) ---------`);
       const tokens = await getTokens(accountConfig);
-      const initialUserData = await getUserStats(accountConfig, tokens);
-
-      if (!initialUserData || !initialUserData.stats) {
-        throw new Error('无法获取初始用户统计信息');
+      
+      // 清理之前的统计数据以释放内存
+      if (global.gc) {
+        global.gc();
       }
-
-      const initialValidCount = initialUserData.stats.stork_signed_prices_valid_count || 0;
-      const initialInvalidCount = initialUserData.stats.stork_signed_prices_invalid_count || 0;
-
-      if (!tokenManager.previousStats) {
-        tokenManager.previousStats = {
-          validCount: initialValidCount,
-          invalidCount: initialInvalidCount
-        };
-      }
-
+      
       const signedPrices = await getSignedPrices(accountConfig, tokens);
       const proxies = loadProxies(accountConfig);
 
@@ -511,56 +543,59 @@ if (!isMainThread) {
       log(`账号 ${accountConfig.cognito.username} 使用 ${accountConfig.threads.maxWorkers} 个工作线程处理 ${signedPrices.length} 个数据点...`);
       const workers = [];
 
-      // 将数据分成多个批次
-      const chunkSize = Math.ceil(signedPrices.length / accountConfig.threads.maxWorkers);
-      const batches = [];
-      for (let i = 0; i < signedPrices.length; i += chunkSize) {
-        batches.push(signedPrices.slice(i, i + chunkSize));
-      }
-
-      // 为每个批次创建工作线程
-      for (let i = 0; i < Math.min(batches.length, accountConfig.threads.maxWorkers); i++) {
-        const batch = batches[i];
+      // 优化批处理逻辑，减少内存占用
+      for (let i = 0; i < signedPrices.length; i++) {
+        const priceData = signedPrices[i];
         const proxy = proxies.length > 0 ? proxies[i % proxies.length] : null;
 
-        batch.forEach(priceData => {
-          workers.push(new Promise((resolve) => {
-            const worker = new Worker(new URL(import.meta.url), {
-              workerData: { priceData, tokens, proxy, config: accountConfig }
-            });
-            worker.on('message', resolve);
-            worker.on('error', (error) => resolve({ success: false, error: error.message }));
-            worker.on('exit', () => resolve({ success: false, error: 'Worker 已退出' }));
-          }));
-        });
+        workers.push(new Promise((resolve) => {
+          const worker = new Worker(new URL(import.meta.url), {
+            workerData: { 
+              priceData, 
+              tokens: { accessToken: tokens.accessToken }, // 只传递必要的token信息
+              proxy, 
+              config: {
+                stork: {
+                  baseURL: accountConfig.stork.baseURL,
+                  origin: accountConfig.stork.origin,
+                  userAgent: accountConfig.stork.userAgent
+                }
+              } // 只传递必要的配置信息
+            }
+          });
+          worker.on('message', (result) => {
+            worker.terminate(); // 及时终止工作线程
+            resolve(result);
+          });
+          worker.on('error', (error) => {
+            worker.terminate();
+            resolve({ success: false, error: error.message });
+          });
+          worker.on('exit', () => {
+            resolve({ success: false, error: 'Worker 已退出' });
+          });
+        }));
+
+        // 每处理一定数量的数据就等待完成，避免同时创建太多worker
+        if (workers.length >= accountConfig.threads.maxWorkers) {
+          await Promise.all(workers);
+          workers.length = 0;
+        }
       }
 
-      // 等待所有工作线程完成
-      const results = await Promise.all(workers);
-      const successCount = results.filter(r => r.success).length;
-      const failedCount = results.filter(r => !r.success).length;
-      log(`账号 ${accountConfig.cognito.username} 成功处理 ${successCount}/${results.length} 个验证`);
+      // 处理剩余的worker
+      if (workers.length > 0) {
+        await Promise.all(workers);
+      }
 
       // 更新统计信息
       const updatedUserData = await getUserStats(accountConfig, tokens);
-      const newValidCount = updatedUserData.stats.stork_signed_prices_valid_count || 0;
-      const newInvalidCount = updatedUserData.stats.stork_signed_prices_invalid_count || 0;
-
-      const actualValidIncrease = newValidCount - tokenManager.previousStats.validCount;
-      const actualInvalidIncrease = newInvalidCount - tokenManager.previousStats.invalidCount;
-
-      tokenManager.previousStats.validCount = newValidCount;
-      tokenManager.previousStats.invalidCount = newInvalidCount;
-
-      // 显示统计信息
       displayStats(updatedUserData, accountConfig);
-      log(`--------- 验证总结 (${accountConfig.cognito.username}) ---------`);
-      log(`本次处理数据: ${results.length} 个`);
-      log(`成功验证: ${successCount} 个`);
-      log(`验证失败: ${failedCount} 个`);
-      log(`累计有效验证: ${newValidCount} 个`);
-      log(`累计无效验证: ${newInvalidCount} 个`);
-      log('--------- 完成 ---------');
+      
+      // 清理内存
+      if (global.gc) {
+        global.gc();
+      }
     } catch (error) {
       log(`账号 ${accountConfig.cognito.username} 验证进程停止: ${error.message}`, 'ERROR');
     }
@@ -625,7 +660,7 @@ if (!isMainThread) {
         origin: 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl'
       },
       threads: {
-        maxWorkers: 10,
+        maxWorkers: 1, // 减少每个账号的工作线程
         proxyFile: path.join(__dirname, proxyFileName)
       }
     };
@@ -637,30 +672,64 @@ if (!isMainThread) {
 
     const tokenManager = new TokenManager(accountConfig, accountPool);
     
-    try {
-      await tokenManager.getValidToken();
-      log(`账号 ${account.username} 初始认证成功`);
-
-      // 启动验证进程
-      const runProcess = () => runValidationProcess(tokenManager, accountConfig);
-      runProcess();
-      setInterval(runProcess, accountConfig.stork.intervalSeconds * 1000);
-      
-      // 定期刷新 token
-      setInterval(async () => {
+    const maxRetries = 3;
+    const retryDelay = 180000; // 3分钟
+    
+    async function attemptStart(retryCount = 0) {
+      try {
         await tokenManager.getValidToken();
-        log(`账号 ${account.username} 通过 Cognito 刷新 Token`);
-      }, 50 * 60 * 1000);
-    } catch (error) {
-      log(`账号 ${account.username} 启动失败: ${error.message}`, 'ERROR');
+        log(`账号 ${account.username} 初始认证成功`);
+
+        // 启动验证进程
+        const runProcess = () => runValidationProcess(tokenManager, accountConfig);
+        runProcess();
+        setInterval(runProcess, accountConfig.stork.intervalSeconds * 1000);
+        
+        // 定期刷新 token
+        setInterval(async () => {
+          await tokenManager.getValidToken();
+          log(`账号 ${account.username} 通过 Cognito 刷新 Token`);
+        }, 50 * 60 * 1000);
+      } catch (error) {
+        if (error.message.includes('Too many requests') && retryCount < maxRetries) {
+          log(`账号 ${account.username} 遇到请求限制，${retryDelay/1000}秒后重试 (${retryCount + 1}/${maxRetries})`, 'WARN');
+          setTimeout(() => attemptStart(retryCount + 1), retryDelay);
+        } else {
+          log(`账号 ${account.username} 启动失败: ${error.message}`, 'ERROR');
+        }
+      }
     }
+
+    attemptStart();
   }
 
   // 主函数
   async function main() {
     try {
-      // 获取所有账号配置
-      const accounts = await getUserInput();
+      console.log('\n请选择运行模式:');
+      console.log('1. 手动输入账号信息');
+      console.log('2. 从配置文件读取账号信息');
+      
+      const mode = await prompt('请输入选择 (1/2): ');
+      
+      let accounts = [];
+      
+      if (mode === '1') {
+        // 手动输入模式
+        accounts = await getUserInput();
+      } else if (mode === '2') {
+        // 文本配置文件模式
+        const textFileAccounts = await loadAccountsFromTextFile();
+        if (!textFileAccounts) {
+          log('从配置文件加载失败，切换到手动输入模式');
+          accounts = await getUserInput();
+        } else {
+          accounts = textFileAccounts;
+          log(`从配置文件成功加载 ${accounts.length} 个账号`);
+        }
+      } else {
+        throw new Error('无效的选择');
+      }
       
       if (accounts.length === 0) {
         throw new Error('未配置任何账号');
@@ -668,10 +737,31 @@ if (!isMainThread) {
 
       log(`成功配置 ${accounts.length} 个账号`);
       
-      // 为每个账号创建验证进程
-      accounts.forEach(account => {
-        createValidationProcess(account);
+      // 将账号分组，每组10个账号
+      const groupSize = 10;
+      const accountGroups = [];
+      for (let i = 0; i < accounts.length; i += groupSize) {
+        accountGroups.push(accounts.slice(i, i + groupSize));
+      }
+      
+      // 为每组账号创建验证进程，并错开启动时间
+      accountGroups.forEach((group, groupIndex) => {
+        setTimeout(() => {
+          log(`启动第 ${groupIndex + 1} 组账号（${group.length} 个账号）`);
+          group.forEach(account => {
+            createValidationProcess(account);
+          });
+        }, groupIndex * 10000); // 每组间隔10秒启动
       });
+
+      // 定期进行内存清理
+      setInterval(() => {
+        if (global.gc) {
+          global.gc();
+          log('执行内存清理');
+        }
+      }, 300000); // 每5分钟清理一次内存
+
     } catch (error) {
       log(`应用程序启动失败: ${error.message}`, 'ERROR');
       process.exit(1);
